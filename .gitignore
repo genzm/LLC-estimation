@@ -11,6 +11,7 @@ wheels/
 
 # Archive (old/backup files)
 archive/
+archive2/
 
 # Output figures
 figures/

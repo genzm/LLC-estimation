@@ -14,7 +14,7 @@ def get_lambda_data(d, dl, r):
         return base / 8.0 if term % 2 == 0 else (base + 1) / 8.0
 
 def get_lambda_w(d, dl, r, alpha):
-    if r > d or r < 1 or dl < 1: return 0.0
+    if r + alpha > d + 1 or r < 1 or dl < 1: return 0.0
     upper = 2 * (d + 1) - (r + alpha)
     lower = r + alpha
     term = dl + r + alpha
@@ -53,9 +53,9 @@ def get_LSA_query(d, d_l, r1, r2):
 
 def plot_analysis_with_boundaries():
     # === Parameters ===
-    d_fixed = 5
-    r_samples = [1, 3, 5]
-    dl_max = 25
+    d_fixed = 15
+    r_samples = [1, 5, 10, 14]
+    dl_max = 60
     alphas = [0, 1, 2]
     # ==================
 
@@ -74,17 +74,15 @@ def plot_analysis_with_boundaries():
         bound_linear = r                # Boundary 1: d_l = r
         bound_saturation = 2 * d_fixed - r # Boundary 2: d_l = 2d - r
 
-        # 1. LSA Query Lines
-        # r1 ([d, d_l, 1]) = 1, d-2, d を試す
-        # r2 ([1, d_l, 1]) = 1 で固定
-        r2_fixed = 1
-        r1_list = [1]  # 1, d-2, d
-        lsa_colors = ['black', 'gray', 'brown']
-        lsa_styles = ['--', ':', '-.']
-        for k, r1 in enumerate(r1_list):
-            la_values = [get_LSA_query(d_fixed, dl, r1, r2_fixed) for dl in dl_range]
-            ax.plot(dl_range, la_values, color=lsa_colors[k], linestyle=lsa_styles[k],
-                    linewidth=1.5, alpha=0.7, label=f'LSA Query (r1={r1})')
+        # 1. LSA Query Lines (commented out: r1, r2 fixed values unrelated to panel's r)
+        # r2_fixed = 1
+        # r1_list = [1]
+        # lsa_colors = ['black', 'gray', 'brown']
+        # lsa_styles = ['--', ':', '-.']
+        # for k, r1 in enumerate(r1_list):
+        #     la_values = [get_LSA_query(d_fixed, dl, r1, r2_fixed) for dl in dl_range]
+        #     ax.plot(dl_range, la_values, color=lsa_colors[k], linestyle=lsa_styles[k],
+        #             linewidth=1.5, alpha=0.7, label=f'LSA Query (r1={r1})')
 
         # 2. Phase Boundaries (Vertical Lines & Shading)
         # 色分け: 線形領域境界(Magenta), 飽和領域境界(Cyan)
@@ -96,8 +94,18 @@ def plot_analysis_with_boundaries():
         if bound_linear < bound_saturation:
             ax.axvspan(bound_linear, bound_saturation, color='yellow', alpha=0.05, label='Transition Zone')
 
-        # 3. Diff Curves Plotting
+        # 2.5. SLA Theory line: λ_SLA = λ_matrix + (d + 0.5)
+        ax.axhline(y=d_fixed + 0.5, color='orange', linestyle='-', linewidth=2,
+                   alpha=0.8, label=f'SLA Theory ($d+0.5={d_fixed + 0.5}$)')
+
+        # 2.6. LSA valid range: d_l >= r + alpha (lower bound per alpha)
         colors = ['blue', 'green', 'red']
+        for j, alpha in enumerate(alphas):
+            dl_lower = r + alpha
+            ax.axvline(x=dl_lower, color=colors[j], linestyle=':', linewidth=1, alpha=0.5,
+                       label=f'$d_l \\geq r+\\alpha={dl_lower}$ (α={alpha})')
+
+        # 3. Diff Curves Plotting
         for j, alpha in enumerate(alphas):
             diff_values = []
             for dl in dl_range:
