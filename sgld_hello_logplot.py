@@ -3,12 +3,14 @@
 # 理論値: Aoyagi (2024) の Theorem 1
 # Figure 3 (Left) の再現: 複数規模のモデルで理論値 vs 推定値をプロット
 
-from typing import Literal, Union, List, Tuple, Optional, Set
+from typing import List, Tuple, Optional, Set
 import torch
 import torch.nn as nn
 import numpy as np
 import matplotlib.pyplot as plt
 from tqdm import tqdm
+
+from lsa_common import SGLD
 
 
 # ============================================================
@@ -175,52 +177,7 @@ def compute_llc_theoretical(H: List[int], r: int) -> float:
 
 
 # ============================================================
-# 3. SGLD オプティマイザ
-# ============================================================
-
-class SGLD(torch.optim.Optimizer):
-    def __init__(self, params, lr=1e-3, noise_level=1., elasticity=0.,
-                 temperature: Union[Literal['adaptive'], float]=1.,
-                 bounding_box_size=None, num_samples=1, batch_size=None):
-        defaults = dict(lr=lr, noise_level=noise_level, elasticity=elasticity,
-                        temperature=temperature, bounding_box_size=None,
-                        num_samples=num_samples, batch_size=batch_size)
-        super(SGLD, self).__init__(params, defaults)
-
-        for group in self.param_groups:
-            if group['elasticity'] != 0:
-                for p in group['params']:
-                    param_state = self.state[p]
-                    param_state['initial_param'] = torch.clone(p.data).detach()
-            if group['temperature'] == "adaptive":
-                group['temperature'] = np.log(group["num_samples"])
-
-    def step(self, closure=None):
-        for group in self.param_groups:
-            for p in group['params']:
-                with torch.no_grad():
-                    if p.grad is None:
-                        continue
-
-                    dw = p.grad * (group["num_samples"] / group["batch_size"]) / group['temperature']
-
-                    if group['elasticity'] != 0:
-                        initial_param = self.state[p]['initial_param']
-                        dw.add_((p - initial_param), alpha=group['elasticity'])
-
-                    p.add_(dw, alpha=-0.5 * group['lr'])
-
-                    noise = torch.normal(mean=0., std=group['noise_level'],
-                                         size=dw.size(), device=dw.device)
-                    p.add_(noise, alpha=group['lr'] ** 0.5)
-
-                    if group['bounding_box_size'] is not None:
-                        torch.clamp_(p, min=-group['bounding_box_size'],
-                                     max=group['bounding_box_size'])
-
-
-# ============================================================
-# 4. 単一実験の関数化
+# 3. 単一実験の関数化
 # ============================================================
 
 def run_single_experiment(
