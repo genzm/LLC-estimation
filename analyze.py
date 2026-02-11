@@ -84,11 +84,7 @@ def plot_analysis_with_boundaries():
         if bound_linear < bound_saturation:
             ax.axvspan(bound_linear, bound_saturation, color='yellow', alpha=0.05, label='Transition Zone')
 
-        # 2.5. LSA Theory line: λ_LSA = λ_matrix + (d + 0.5)
-        ax.axhline(y=d_fixed + 0.5, color='orange', linestyle='-', linewidth=2,
-                   alpha=0.8, label=f'LSA Theory ($d+0.5={d_fixed + 0.5}$)')
-
-        # 2.6. LSA valid range: d_l >= r + alpha (lower bound per alpha)
+        # LSA valid range: d_l >= r + alpha (lower bound per alpha)
         colors = ['blue', 'green', 'red']
         for j, alpha in enumerate(alphas):
             dl_lower = r + alpha

@@ -101,28 +101,6 @@ def compute_llc_theoretical_dln(H: List[int], r: int) -> float:
         return base / 8.0 if term % 2 == 0 else (base + 1) / 8.0
 
 
-def compute_llc_theoretical_lsa(d: int, d_l: int, r: int) -> float:
-    """
-    LSA モデルの LLC 理論値計算 (Note_1208_Yang.pdf 準拠)
-
-    λ_LSA = λ_matrix + (d + 0.5)
-
-    - λ_matrix: W_Q[:d,:] @ W_K[:d,:].T の RLCT (2層DLN として計算)
-    - (d + 0.5): Cross part (履歴-クエリ相互作用) の寄与
-    """
-    max_possible_rank = min(d, d_l)
-    if r > max_possible_rank:
-        raise ValueError(f"Rank r={r} is impossible for d={d}, d_l={d_l}")
-
-    H = [d, d_l, d]
-    lambda_matrix = compute_llc_theoretical_dln(H, r)
-
-    # Note Eq.(28)-(30) より: Cross part の寄与 = (d + 0.5)
-    lambda_lsa = lambda_matrix + (d + 0.5)
-
-    return lambda_lsa
-
-
 # ============================================================
 # 3. モデル生成 (Global Rank Constraint + α 制御版)
 # ============================================================
@@ -469,7 +447,7 @@ def run_single_experiment(
         ...
 
     Returns:
-        dict: {params, true_llc, est_llc, std_error, d, d_l, r_M, alpha, ...} or None (失敗時)
+        dict: {params, lambda_matrix, lambda_full, est_llc, std_error, d, d_l, r_M, alpha, ...} or None (失敗時)
     """
     try:
         # --- モデル生成 (α 制御版) ---
@@ -488,19 +466,16 @@ def run_single_experiment(
         teacher_model, rank_M, rank_B = create_lsa_with_alpha(d, d_l, r_M, target_alpha, device=device)
 
         # 理論値計算
-        # 1. λ_LSA = λ_matrix + (d + 0.5)  (d×d 部分 + 補正)
-        llc_true = compute_llc_theoretical_lsa(d, d_l, rank_M)
-
-        # 2. λ_matrix (d×d 部分、補正なし)
+        # 1. λ_matrix (d×d 部分)
         H_dln = [d, d_l, d]
         lambda_matrix = compute_llc_theoretical_dln(H_dln, rank_M)
 
-        # 3. λ_full ((d+1)×(d+1) 全体を DLN とみなす)
+        # 2. λ_full ((d+1)×(d+1) 全体を DLN とみなす)
         H_full = [d+1, d_l, d+1]
         lambda_full = compute_llc_theoretical_dln(H_full, rank_B)
 
-        # rank_M=0 または llc_true=0 の場合はスキップ（相対誤差が計算できない）
-        if rank_M == 0 or llc_true == 0:
+        # rank_M=0 または lambda_matrix=0 の場合はスキップ（相対誤差が計算できない）
+        if rank_M == 0 or lambda_matrix == 0:
             return None
 
         # Student/Initial モデル構築 (Teacher と同じ構造・パラメータで初期化)
@@ -581,7 +556,6 @@ def run_single_experiment(
         actual_alpha = rank_B - rank_M
         return {
             "params": param_count,
-            "true_llc": llc_true,        # λ_LSA = λ_matrix + (d + 0.5)
             "lambda_matrix": lambda_matrix,  # λ_matrix (d×d 部分)
             "lambda_full": lambda_full,   # λ_full ((d+1)×(d+1) 全体)
             "est_llc": llc_est,
@@ -661,7 +635,7 @@ def run_all_experiments(
         # 途中経過
         scale_results = [r for r in results if r["scale"] == name]
         if scale_results:
-            errors = [abs(r["est_llc"] - r["true_llc"]) / r["true_llc"] * 100
+            errors = [abs(r["est_llc"] - r["lambda_matrix"]) / r["lambda_matrix"] * 100
                       for r in scale_results]
             alpha_dist = {}
             for r in scale_results:
@@ -673,7 +647,7 @@ def run_all_experiments(
 
 
 def plot_results(results: List[dict], save_path: str = None, dl_ratio_range: Tuple[float, float] = None, alpha_list: List[int] = None):
-    """Log-Log プロットを作成（α でグループ化、最大3行3列）"""
+    """Log-Log プロットを作成（α でグループ化、2列: λ_matrix, λ_full）"""
     if not results:
         print("結果がありません")
         return
@@ -682,7 +656,7 @@ def plot_results(results: List[dict], save_path: str = None, dl_ratio_range: Tup
     alpha_values = sorted(set(r.get("alpha", 0) for r in results))
     num_alphas = len(alpha_values)
 
-    fig, axes = plt.subplots(num_alphas, 3, figsize=(20, 4 * num_alphas + 2))
+    fig, axes = plt.subplots(num_alphas, 2, figsize=(14, 4 * num_alphas + 2))
     if num_alphas == 1:
         axes = axes.reshape(1, -1)
 
@@ -703,93 +677,67 @@ def plot_results(results: List[dict], save_path: str = None, dl_ratio_range: Tup
         if not alpha_results:
             continue
 
-        true_llcs = np.array([r["true_llc"] for r in alpha_results])
         lambda_matrix = np.array([r["lambda_matrix"] for r in alpha_results])
         lambda_full = np.array([r["lambda_full"] for r in alpha_results])
         est_llcs = np.array([r["est_llc"] for r in alpha_results])
         params = np.array([r["params"] for r in alpha_results])
         log_params = np.log10(params)
 
-        # === 列1: λ_LSA vs 推定値 ===
+        # === 列1: λ_matrix vs 推定値 ===
         ax1 = axes[row, 0]
-        sc1 = ax1.scatter(true_llcs, est_llcs, c=log_params, cmap='magma', vmin=vmin, vmax=vmax,
+        sc1 = ax1.scatter(lambda_matrix, est_llcs, c=log_params, cmap='magma', vmin=vmin, vmax=vmax,
                           alpha=0.7, s=50, edgecolors='white', linewidth=0.5)
 
-        min_val1 = min(true_llcs.min(), est_llcs.min()) * 0.8
-        max_val1 = max(true_llcs.max(), est_llcs.max()) * 1.2
-        ax1.plot([min_val1, max_val1], [min_val1, max_val1], 'k--', alpha=0.5, label='y=x')
+        plot_min, plot_max = 1e2, 1e3
+        ax1.plot([plot_min, plot_max], [plot_min, plot_max], 'k--', alpha=0.5, label='y=x')
 
         ax1.set_xscale('log')
         ax1.set_yscale('log')
-        ax1.set_xlim(min_val1, max_val1)
-        ax1.set_ylim(min_val1, max_val1)
+        ax1.set_xlim(plot_min, plot_max)
+        ax1.set_ylim(plot_min, plot_max)
 
-        ax1.set_xlabel(r'$\lambda_{LSA} = \lambda_{matrix} + (d + 0.5)$', fontsize=11)
+        ax1.set_xlabel(r'$\lambda_{matrix}$ [d, d_l, d]', fontsize=11)
         ax1.set_ylabel(r'Estimated LLC $\hat{\lambda}(w^*)$', fontsize=11)
-        ax1.set_title(f'α={alpha_val}: λ_LSA vs Estimated', fontsize=11)
+        ax1.set_title(f'α={alpha_val}: λ_matrix vs Estimated', fontsize=11)
 
-        errors1 = np.abs(est_llcs - true_llcs) / true_llcs * 100
+        errors1 = np.abs(est_llcs - lambda_matrix) / lambda_matrix * 100
         textstr1 = f'N={len(alpha_results)}\nMean: {np.mean(errors1):.1f}%\nMedian: {np.median(errors1):.1f}%'
         ax1.text(0.05, 0.95, textstr1, transform=ax1.transAxes, fontsize=9,
                  verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
         ax1.legend(loc='lower right')
         ax1.grid(True, alpha=0.3)
 
-        # === 列2: λ_matrix vs 推定値 ===
+        # === 列2: λ_full vs 推定値 ===
         ax2 = axes[row, 1]
-        sc2 = ax2.scatter(lambda_matrix, est_llcs, c=log_params, cmap='magma', vmin=vmin, vmax=vmax,
+        sc2 = ax2.scatter(lambda_full, est_llcs, c=log_params, cmap='magma', vmin=vmin, vmax=vmax,
                           alpha=0.7, s=50, edgecolors='white', linewidth=0.5)
 
-        min_val2 = min(lambda_matrix.min(), est_llcs.min()) * 0.8
-        max_val2 = max(lambda_matrix.max(), est_llcs.max()) * 1.2
-        ax2.plot([min_val2, max_val2], [min_val2, max_val2], 'k--', alpha=0.5, label='y=x')
+        ax2.plot([plot_min, plot_max], [plot_min, plot_max], 'k--', alpha=0.5, label='y=x')
 
         ax2.set_xscale('log')
         ax2.set_yscale('log')
-        ax2.set_xlim(min_val2, max_val2)
-        ax2.set_ylim(min_val2, max_val2)
+        ax2.set_xlim(plot_min, plot_max)
+        ax2.set_ylim(plot_min, plot_max)
 
-        ax2.set_xlabel(r'$\lambda_{matrix}$ [d, d_l, d]', fontsize=11)
+        ax2.set_xlabel(r'$\lambda_{full}$ [d+1, d_l, d+1]', fontsize=11)
         ax2.set_ylabel(r'Estimated LLC $\hat{\lambda}(w^*)$', fontsize=11)
-        ax2.set_title(f'α={alpha_val}: λ_matrix vs Estimated', fontsize=11)
+        ax2.set_title(f'α={alpha_val}: λ_full vs Estimated', fontsize=11)
 
-        errors2 = np.abs(est_llcs - lambda_matrix) / lambda_matrix * 100
+        errors2 = np.abs(est_llcs - lambda_full) / lambda_full * 100
         textstr2 = f'N={len(alpha_results)}\nMean: {np.mean(errors2):.1f}%\nMedian: {np.median(errors2):.1f}%'
         ax2.text(0.05, 0.95, textstr2, transform=ax2.transAxes, fontsize=9,
                  verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
         ax2.legend(loc='lower right')
         ax2.grid(True, alpha=0.3)
 
-        # === 列3: λ_full vs 推定値 ===
-        ax3 = axes[row, 2]
-        sc3 = ax3.scatter(lambda_full, est_llcs, c=log_params, cmap='magma', vmin=vmin, vmax=vmax,
-                          alpha=0.7, s=50, edgecolors='white', linewidth=0.5)
+    # 全行共通の colorbar を図の右端に配置（プロットサイズを均一に保つ）
+    fig.subplots_adjust(right=0.88)
+    cbar_ax = fig.add_axes([0.90, 0.08, 0.02, 0.84])
+    sm = plt.cm.ScalarMappable(cmap='magma', norm=plt.Normalize(vmin=vmin, vmax=vmax))
+    cbar = fig.colorbar(sm, cax=cbar_ax)
+    cbar.set_label('Log10 Params', fontsize=10)
 
-        min_val3 = min(lambda_full.min(), est_llcs.min()) * 0.8
-        max_val3 = max(lambda_full.max(), est_llcs.max()) * 1.2
-        ax3.plot([min_val3, max_val3], [min_val3, max_val3], 'k--', alpha=0.5, label='y=x')
-
-        ax3.set_xscale('log')
-        ax3.set_yscale('log')
-        ax3.set_xlim(min_val3, max_val3)
-        ax3.set_ylim(min_val3, max_val3)
-
-        ax3.set_xlabel(r'$\lambda_{full}$ [d+1, d_l, d+1]', fontsize=11)
-        ax3.set_ylabel(r'Estimated LLC $\hat{\lambda}(w^*)$', fontsize=11)
-        ax3.set_title(f'α={alpha_val}: λ_full vs Estimated', fontsize=11)
-
-        errors3 = np.abs(est_llcs - lambda_full) / lambda_full * 100
-        textstr3 = f'N={len(alpha_results)}\nMean: {np.mean(errors3):.1f}%\nMedian: {np.median(errors3):.1f}%'
-        ax3.text(0.05, 0.95, textstr3, transform=ax3.transAxes, fontsize=9,
-                 verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
-        ax3.legend(loc='lower right')
-        ax3.grid(True, alpha=0.3)
-
-        # 各行の右端に colorbar を追加（最後の列のみ）
-        cbar = plt.colorbar(sc3, ax=ax3)
-        cbar.set_label('Log10 Params', fontsize=9)
-
-    plt.tight_layout()
+    plt.tight_layout(rect=[0, 0, 0.88, 0.96])
 
     if save_path:
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
@@ -819,16 +767,14 @@ def print_summary(results: List[dict]):
         print(f"α = {alpha_val} のケース ({len(alpha_results)} 試行)")
         print(f"{'='*60}")
 
-        # 3つの理論値との誤差を計算
-        errors_lsa = [abs(r["est_llc"] - r["true_llc"]) / r["true_llc"] * 100 for r in alpha_results]
+        # 2つの理論値との誤差を計算
         errors_matrix = [abs(r["est_llc"] - r["lambda_matrix"]) / r["lambda_matrix"] * 100 for r in alpha_results]
         errors_full = [abs(r["est_llc"] - r["lambda_full"]) / r["lambda_full"] * 100 for r in alpha_results]
 
         print(f"\n{'理論値':<35} {'平均誤差':<12} {'中央値誤差':<12}")
         print("-" * 60)
-        print(f"{'(1) λ_LSA = λ_matrix + (d+0.5)':<35} {np.mean(errors_lsa):>8.1f}%    {np.median(errors_lsa):>8.1f}%")
-        print(f"{'(2) λ_matrix [d, d_l, d]':<35} {np.mean(errors_matrix):>8.1f}%    {np.median(errors_matrix):>8.1f}%")
-        print(f"{'(3) λ_full [d+1, d_l, d+1]':<35} {np.mean(errors_full):>8.1f}%    {np.median(errors_full):>8.1f}%")
+        print(f"{'(1) λ_matrix [d, d_l, d]':<35} {np.mean(errors_matrix):>8.1f}%    {np.median(errors_matrix):>8.1f}%")
+        print(f"{'(2) λ_full [d+1, d_l, d+1]':<35} {np.mean(errors_full):>8.1f}%    {np.median(errors_full):>8.1f}%")
 
         # ランクと次元の統計
         r_list = [r.get("r_M", r["rank_M"]) for r in alpha_results]
