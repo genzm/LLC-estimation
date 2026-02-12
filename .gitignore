@@ -15,3 +15,6 @@ archive2/
 
 # Output figures
 figures/
+
+# Experiment results
+results/
