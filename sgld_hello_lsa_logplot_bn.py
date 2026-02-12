@@ -2,7 +2,8 @@
 # d_l の範囲: r ≤ d_l ≤ 2d - r
 
 import torch
-from lsa_common import run_all_experiments, print_summary, plot_results, CONFIGS
+from lsa_alpha import run_all_experiments, print_summary, plot_results
+from lsa_common import CONFIGS
 
 DL_RATIO_RANGE = (0.5, 1.5)
 ALPHA_LIST = [0, 1, 2]

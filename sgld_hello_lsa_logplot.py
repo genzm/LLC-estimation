@@ -2,7 +2,8 @@
 # d_l の範囲に 2d - d_l 制約を適用しない
 
 import torch
-from lsa_common import run_all_experiments, print_summary, plot_results, CONFIGS
+from lsa_alpha import run_all_experiments, print_summary, plot_results
+from lsa_common import CONFIGS
 
 DL_RATIO_RANGE = (2.5, 3.5)
 ALPHA_LIST = [0, 1, 2]

@@ -1,12 +1,10 @@
 # LSA 実験共通モジュール
-# SGLD, SelfLinearAttention, 理論値計算, 実験ランナー等を集約
+# SGLD, SelfLinearAttention, 理論値計算, データ生成, LLC推定等を集約
 
 from typing import Literal, Union, List, Tuple, Optional
 import torch
 import torch.nn as nn
 import numpy as np
-import matplotlib.pyplot as plt
-from tqdm import tqdm
 
 
 # ============================================================
@@ -102,221 +100,7 @@ def compute_llc_theoretical_dln(H: List[int], r: int) -> float:
 
 
 # ============================================================
-# 3. モデル生成 (Global Rank Constraint + α 制御版)
-# ============================================================
-
-def generate_random_lsa_config(
-    d_low: int = 5,
-    d_high: int = 15,
-    dl_ratio_range: Tuple[float, float] = (0.5, 1.5),
-    alpha_list: List[int] = [0, 1, 2],
-    max_retries: int = 100,
-    use_bottleneck: bool = True
-) -> Optional[Tuple[int, int, int, int]]:
-    """
-    α 制御付き LSA 構成を生成
-
-    決定順序:
-        1. d を決める
-        2. d_l を決める (d * ratio)
-        3. α を決める (0, 1, 2)
-        4. r_M を決める (制約を満たす範囲で)
-
-    制約:
-        - r_M ≥ 1
-        - r_M ≤ d_l - α (分解可能条件: r_B = r_M + α ≤ d_l)
-        - r_M ≤ 2d - d_l (ボトルネック条件、use_bottleneck=True の場合)
-        - r_M ≤ d - 1 (フルランクを避ける)
-
-    Args:
-        d_low, d_high: d の範囲
-        dl_ratio_range: d_l/d の比率の範囲
-        alpha_list: 選択可能な α のリスト
-        max_retries: 有効な組み合わせを見つけるまでの最大リトライ回数
-        use_bottleneck: True の場合、r_M ≤ 2d - d_l のボトルネック条件を適用
-
-    Returns:
-        (d, d_l, r_M, alpha) or None (有効な組み合わせが見つからない場合)
-    """
-    for _ in range(max_retries):
-        # 1. d を決める
-        d = np.random.randint(d_low, d_high + 1)
-
-        # 2. d_l を決める
-        dl_ratio = np.random.uniform(dl_ratio_range[0], dl_ratio_range[1])
-        d_l = max(1, int(d * dl_ratio))
-
-        # 3. α を決める
-        alpha = np.random.choice(alpha_list)
-
-        # 4. r_M の範囲を計算
-        r_M_min = 1
-        if use_bottleneck:
-            r_M_max = min(d_l - alpha, 2 * d - d_l, d - 1)
-        else:
-            r_M_max = min(d_l - alpha, d - 1)
-
-        # 有効な範囲かチェック
-        if r_M_max >= r_M_min:
-            r_M = np.random.randint(r_M_min, r_M_max + 1)
-            return d, d_l, r_M, alpha
-
-    # 有効な組み合わせが見つからなかった
-    return None
-
-
-def create_lsa_with_alpha(
-    d: int,
-    d_l: int,
-    r_M: int,
-    alpha: int,
-    init_scale: float = 0.1,
-    device: str = 'cpu'
-) -> Tuple[SelfLinearAttention, int, int]:
-    """
-    α を指定して LSA モデルを生成
-
-    B = [ M    | b_col ]   (d+1) × (d+1)
-        [------+-------]
-        [b_row | corner]
-
-    α の制御:
-        - α = 0: b_col ∈ Col(M), b_row ∈ Row(M)
-        - α = 1: b_col ∉ Col(M) xor b_row ∉ Row(M)
-        - α = 2: b_col ∉ Col(M) and b_row ∉ Row(M)
-
-    Args:
-        d: 入力次元
-        d_l: 潜在次元
-        r_M: M のランク
-        alpha: 目標 α (0, 1, 2)
-        init_scale: 初期化スケール
-        device: デバイス
-
-    Returns:
-        model: 生成された LSA モデル
-        rank_M: 実測 rank(M)
-        rank_B: 実測 rank(B)
-    """
-    input_dim = d + 1
-    r_B = r_M + alpha  # B の目標ランク
-
-    with torch.no_grad():
-        # Step 1: M (d×d) を rank = r_M で作成
-        # M = U_M @ diag(S_M) @ V_M.T
-        U_M = torch.randn(d, r_M, device=device)
-        U_M, _ = torch.linalg.qr(U_M)  # 正規直交化
-        V_M = torch.randn(d, r_M, device=device)
-        V_M, _ = torch.linalg.qr(V_M)
-        S_M = torch.abs(torch.randn(r_M, device=device)) * init_scale + 0.1  # 正の特異値
-
-        M = U_M @ torch.diag(S_M) @ V_M.T  # d × d, rank = r_M
-
-        # Step 2: α に応じて b_col, b_row を構成
-        if alpha == 0:
-            # b_col ∈ Col(M), b_row ∈ Row(M)
-            # b_col = M @ (何かのベクトル) = U_M @ (何か)
-            coef_col = torch.randn(r_M, device=device) * init_scale
-            b_col = U_M @ coef_col  # d × 1, Col(M) 内
-
-            # b_row = (何か) @ M = (何か) @ V_M.T
-            coef_row = torch.randn(r_M, device=device) * init_scale
-            b_row = (V_M @ coef_row).unsqueeze(0)  # 1 × d, Row(M) 内
-
-        elif alpha == 1:
-            # 片方だけ独立 (ここでは b_col を独立にする)
-            # b_col ∉ Col(M): U_M の直交補空間からベクトルを取る
-            U_M_perp = torch.randn(d, 1, device=device)
-            # Gram-Schmidt で U_M に直交化
-            for i in range(r_M):
-                U_M_perp = U_M_perp - (U_M[:, i:i+1].T @ U_M_perp) * U_M[:, i:i+1]
-            U_M_perp = U_M_perp / (torch.norm(U_M_perp) + 1e-8)
-            b_col = U_M_perp.squeeze() * init_scale  # d, Col(M) 外
-
-            # b_row ∈ Row(M)
-            coef_row = torch.randn(r_M, device=device) * init_scale
-            b_row = (V_M @ coef_row).unsqueeze(0)  # 1 × d, Row(M) 内
-
-        elif alpha == 2:
-            # 両方独立
-            # b_col ∉ Col(M)
-            U_M_perp = torch.randn(d, 1, device=device)
-            for i in range(r_M):
-                U_M_perp = U_M_perp - (U_M[:, i:i+1].T @ U_M_perp) * U_M[:, i:i+1]
-            U_M_perp = U_M_perp / (torch.norm(U_M_perp) + 1e-8)
-            b_col = U_M_perp.squeeze() * init_scale
-
-            # b_row ∉ Row(M)
-            V_M_perp = torch.randn(d, 1, device=device)
-            for i in range(r_M):
-                V_M_perp = V_M_perp - (V_M[:, i:i+1].T @ V_M_perp) * V_M[:, i:i+1]
-            V_M_perp = V_M_perp / (torch.norm(V_M_perp) + 1e-8)
-            b_row = V_M_perp.squeeze().unsqueeze(0) * init_scale  # 1 × d
-
-        else:
-            raise ValueError(f"alpha must be 0, 1, or 2, got {alpha}")
-
-        # Step 3: corner を決める
-        if alpha == 0:
-            # rank(B) = rank(M) を保証: corner = b_row @ M^+ @ b_col
-            M_pinv = torch.linalg.pinv(M)
-            corner = b_row @ M_pinv @ b_col.unsqueeze(1)  # 1×1
-        else:
-            # α=1,2 では corner の値に関わらず rank(B) = r_M + α
-            corner = torch.randn(1, 1, device=device) * init_scale
-
-        # Step 4: B を組み立てる
-        # B = [[M, b_col], [b_row, corner]]
-        B = torch.zeros(input_dim, input_dim, device=device)
-        B[:d, :d] = M
-        B[:d, d:] = b_col.unsqueeze(1)
-        B[d:, :d] = b_row
-        B[d:, d:] = corner
-
-        # Step 5: B を W_Q, W_K に分解
-        # B = W_Q @ W_K.T, where W_Q, W_K are (d+1) × d_l
-        U_B, S_B, Vh_B = torch.linalg.svd(B, full_matrices=False)
-
-        # 上位 r_B 個の特異値を使用
-        effective_r = min(r_B, len(S_B), d_l)
-        sqrt_S = torch.sqrt(S_B[:effective_r])
-        U_r = U_B[:, :effective_r]
-        Vh_r = Vh_B[:effective_r, :]
-
-        W_Q_new = torch.zeros(input_dim, d_l, device=device)
-        W_K_new = torch.zeros(input_dim, d_l, device=device)
-        W_Q_new[:, :effective_r] = U_r @ torch.diag(sqrt_S)
-        W_K_new[:, :effective_r] = Vh_r.T @ torch.diag(sqrt_S)
-
-        # モデルを作成
-        model = SelfLinearAttention(input_dim, d_l, init_scale).to(device)
-        model.W_Q.data = W_Q_new
-        model.W_K.data = W_K_new
-
-        # 実効ランクの計測
-        M_check = model.get_effective_matrix()
-        _, S_M_check, _ = torch.linalg.svd(M_check, full_matrices=False)
-        max_s_M = S_M_check[0].item() if S_M_check.numel() > 0 else 0
-        if max_s_M == 0:
-            rank_M_actual = 0
-        else:
-            tol_M = max_s_M * max(M_check.shape) * torch.finfo(M_check.dtype).eps
-            rank_M_actual = (S_M_check > tol_M).sum().item()
-
-        B_check = model.W_Q @ model.W_K.T
-        _, S_B_check, _ = torch.linalg.svd(B_check, full_matrices=False)
-        max_s_B = S_B_check[0].item() if S_B_check.numel() > 0 else 0
-        if max_s_B == 0:
-            rank_B_actual = 0
-        else:
-            tol_B = max_s_B * max(B_check.shape) * torch.finfo(B_check.dtype).eps
-            rank_B_actual = (S_B_check > tol_B).sum().item()
-
-    return model, rank_M_actual, rank_B_actual
-
-
-# ============================================================
-# 4. データ生成 (ICL プロンプト)
+# 3. データ生成 (ICL プロンプト)
 # ============================================================
 
 def generate_icl_batch(num_tasks: int, d: int, N: int, Lambda=None, device='cpu'):
@@ -345,7 +129,7 @@ def generate_icl_batch(num_tasks: int, d: int, N: int, Lambda=None, device='cpu'
 
 
 # ============================================================
-# 5. SGLD オプティマイザ
+# 4. SGLD オプティマイザ
 # ============================================================
 
 class SGLD(torch.optim.Optimizer):
@@ -390,7 +174,7 @@ class SGLD(torch.optim.Optimizer):
 
 
 # ============================================================
-# 6. 損失関数
+# 5. 損失関数
 # ============================================================
 
 def frobenius_loss(H_pred, H_true, normalize=True):
@@ -416,162 +200,156 @@ def frobenius_loss(H_pred, H_true, normalize=True):
 
 
 # ============================================================
-# 7. 単一実験の関数化
+# 6. SGLD による LLC 推定 (正規版)
 # ============================================================
 
-def run_single_experiment(
-    d_range: Tuple[int, int],
-    dl_ratio_range: Tuple[float, float] = (0.5, 1.5),
-    alpha_list: List[int] = [0, 1, 2],
-    N: int = 100,
+def estimate_llc_with_sgld(
+    teacher_model: SelfLinearAttention,
+    x_data: torch.Tensor,
+    *,
+    num_steps: int = 5000,
+    batch_size: int = 500,
     lr: float = 1e-5,
     elasticity: float = 1.0,
-    num_steps: int = 5000,
-    num_data: int = 5000,
-    batch_size: int = 500,
     noise_std: float = 1.0,
     burn_in_ratio: float = 0.9,
-    device: str = 'cpu',
-    use_bottleneck: bool = True
-) -> Optional[dict]:
+) -> Tuple[Optional[float], Optional[float]]:
     """
-    単一の LSA 実験を実行 (α 制御版)
+    SGLD を用いて LLC (Local Learning Coefficient) を推定
 
-    損失関数: K(w) = (1/2) E_X[||h_LSA(X, w) - h_LSA(X, w*)||_F^2]
+    teacher_model から input_dim, latent_dim, device を自動取得する。
+    d_l / device 等の冗長引数は不要。
 
     Args:
-        d_range: d の範囲
-        dl_ratio_range: d_l/d の比率の範囲
-        alpha_list: 選択可能な α のリスト
-        use_bottleneck: True の場合、r_M ≤ 2d - d_l のボトルネック条件を適用
-        ...
+        teacher_model: 真のパラメータを持つ LSA モデル
+        x_data: (num_data, N+1, d+1) ICL プロンプトデータ
+        num_steps: SGLD ステップ数
+        batch_size: ミニバッチサイズ
+        lr: 学習率
+        elasticity: SGLD の弾性係数
+        noise_std: 観測ノイズの標準偏差
+        burn_in_ratio: burn-in 期間の比率
 
     Returns:
-        dict: {params, lambda_matrix, lambda_full, est_llc, std_error, d, d_l, r_M, alpha, ...} or None (失敗時)
+        (est_llc, std_error) or (None, None) (推定失敗時)
     """
-    try:
-        # --- モデル生成 (α 制御版) ---
-        config = generate_random_lsa_config(
-            d_low=d_range[0], d_high=d_range[1],
-            dl_ratio_range=dl_ratio_range,
-            alpha_list=alpha_list,
-            use_bottleneck=use_bottleneck
-        )
-        if config is None:
-            return None
+    num_data = x_data.shape[0]
+    input_dim = teacher_model.input_dim
+    d_l = teacher_model.latent_dim
+    device = next(teacher_model.parameters()).device
 
-        d, d_l, r_M, target_alpha = config
+    teacher_model.eval()
 
-        # Teacher モデル生成 & 実効ランクの計測
-        teacher_model, rank_M, rank_B = create_lsa_with_alpha(d, d_l, r_M, target_alpha, device=device)
+    student_model = SelfLinearAttention(input_dim, d_l).to(device)
+    student_model.load_state_dict(teacher_model.state_dict())
 
-        # 理論値計算
-        # 1. λ_matrix (d×d 部分)
-        H_dln = [d, d_l, d]
-        lambda_matrix = compute_llc_theoretical_dln(H_dln, rank_M)
+    initial_model = SelfLinearAttention(input_dim, d_l).to(device)
+    initial_model.load_state_dict(teacher_model.state_dict())
+    initial_model.eval()
 
-        # 2. λ_full ((d+1)×(d+1) 全体を DLN とみなす)
-        H_full = [d+1, d_l, d+1]
-        lambda_full = compute_llc_theoretical_dln(H_full, rank_B)
+    with torch.no_grad():
+        H_true = teacher_model(x_data)
+        H_data = H_true + torch.randn_like(H_true) * noise_std
 
-        # rank_M=0 または lambda_matrix=0 の場合はスキップ（相対誤差が計算できない）
-        if rank_M == 0 or lambda_matrix == 0:
-            return None
+    beta = 1.0 / np.log(num_data)
+    nll_scale = 1.0 / (2.0 * noise_std**2)
 
-        # Student/Initial モデル構築 (Teacher と同じ構造・パラメータで初期化)
-        input_dim = d + 1
-        student_model = SelfLinearAttention(input_dim, d_l).to(device)
-        student_model.load_state_dict(teacher_model.state_dict())
-        initial_model = SelfLinearAttention(input_dim, d_l).to(device)
-        initial_model.load_state_dict(teacher_model.state_dict())
-        initial_model.eval()
+    optimizer = SGLD(
+        student_model.parameters(),
+        lr=lr,
+        num_samples=num_data,
+        batch_size=batch_size,
+        temperature=1.0,
+        elasticity=elasticity
+    )
 
-        # パラメータ数
-        param_count = sum(p.numel() for p in student_model.parameters())
+    energy_diff_trace = []
+    student_model.train()
 
-        # データ生成（X のみ使用、y は不要）
-        x_data, _ = generate_icl_batch(num_data, d, N, device=device)
+    for _ in range(num_steps):
+        indices = torch.randperm(num_data, device=device)[:batch_size]
+        x_batch = x_data[indices]
+        H_batch = H_data[indices]
 
-        # 真のアテンション行列を計算（ノイズ付き）
+        optimizer.zero_grad()
+
+        H_pred = student_model(x_batch)
+        batch_loss = frobenius_loss(H_pred, H_batch)
+        energy_current = batch_loss * nll_scale * (num_data / batch_size)
+
+        (beta * batch_loss * nll_scale).backward()
+        optimizer.step()
+
         with torch.no_grad():
-            H_true = teacher_model(x_data)
-            # 行列値ガウシアンノイズを追加
-            H_data = H_true + torch.randn_like(H_true) * noise_std
+            H_pred_star = initial_model(x_batch)
+            batch_loss_star = frobenius_loss(H_pred_star, H_batch)
+            energy_star = batch_loss_star * nll_scale * (num_data / batch_size)
 
-        # SGLD 設定
-        beta = 1.0 / np.log(num_data)
-        optimizer = SGLD(
-            student_model.parameters(),
-            lr=lr,
-            num_samples=num_data,
-            batch_size=batch_size,
-            temperature=1.0,
-            elasticity=elasticity
-        )
+        diff = energy_current.item() - energy_star.item()
+        energy_diff_trace.append(diff)
 
-        # NLL スケール: p(Y|X,w) ∝ exp(-||Y - H||_F^2 / (2σ^2))
-        nll_scale = 1.0 / (2.0 * noise_std**2)
+    burn_in = int(num_steps * burn_in_ratio)
+    valid_diffs = [d for d in energy_diff_trace[burn_in:] if np.isfinite(d)]
 
-        energy_diff_trace = []
-        student_model.train()
+    if len(valid_diffs) < 100:
+        return None, None
 
-        # SGLD ループ
-        for step in range(num_steps):
-            indices = torch.randperm(num_data, device=device)[:batch_size]
-            x_batch = x_data[indices]
-            H_batch = H_data[indices]
+    mean_energy_diff = np.mean(valid_diffs)
+    est_llc = beta * mean_energy_diff
+    std_error = beta * np.std(valid_diffs) / np.sqrt(len(valid_diffs))
 
-            optimizer.zero_grad()
+    return est_llc, std_error
 
-            # Frobenius ノルム損失
-            H_pred = student_model(x_batch)
-            batch_loss = frobenius_loss(H_pred, H_batch)
-            energy_current = batch_loss * nll_scale * (num_data / batch_size)
 
-            (beta * batch_loss * nll_scale).backward()
-            optimizer.step()
+# ============================================================
+# 7. ランク指定モデルビルダー (シンプル版)
+# ============================================================
 
-            # Control variate: 初期モデル（= 真のパラメータ）での損失
-            with torch.no_grad():
-                H_pred_star = initial_model(x_batch)
-                batch_loss_star = frobenius_loss(H_pred_star, H_batch)
-                energy_star = batch_loss_star * nll_scale * (num_data / batch_size)
+def create_lsa_rank_only(
+    d: int, d_l: int, rank: int,
+    init_scale: float = 0.1, device: str = 'cpu'
+) -> Tuple[SelfLinearAttention, int]:
+    """
+    rank(B) のみ指定して LSA モデルを生成するシンプルなビルダー
 
-            diff = energy_current.item() - energy_star.item()
-            energy_diff_trace.append(diff)
+    ランダム (d+1)×(d+1) 行列を SVD → 上位 rank 個の特異値を残す → W_Q, W_K に分解
 
-        # LLC 計算
-        burn_in = int(num_steps * burn_in_ratio)
-        valid_diffs = energy_diff_trace[burn_in:]
+    Args:
+        d: 入力次元
+        d_l: 潜在次元
+        rank: 目標 rank(B)
+        init_scale: 初期化スケール
+        device: デバイス
 
-        # NaN/Inf チェック
-        valid_diffs = [d for d in valid_diffs if np.isfinite(d)]
-        if len(valid_diffs) < 100:
-            return None
+    Returns:
+        model: 生成された LSA モデル
+        rank_actual: 実測 rank(B)
+    """
+    input_dim = d + 1
 
-        mean_energy_diff = np.mean(valid_diffs)
-        llc_est = beta * mean_energy_diff
-        std_error = beta * np.std(valid_diffs) / np.sqrt(len(valid_diffs))
+    with torch.no_grad():
+        # ランダム行列を SVD → 上位 rank 個の特異値を残す
+        A = torch.randn(input_dim, input_dim, device=device)
+        U, S, Vh = torch.linalg.svd(A, full_matrices=False)
 
-        actual_alpha = rank_B - rank_M
-        return {
-            "params": param_count,
-            "lambda_matrix": lambda_matrix,  # λ_matrix (d×d 部分)
-            "lambda_full": lambda_full,   # λ_full ((d+1)×(d+1) 全体)
-            "est_llc": llc_est,
-            "std_error": std_error,
-            "d": d,
-            "d_l": d_l,
-            "r_M": r_M,                   # 目標 rank(M)
-            "target_alpha": target_alpha, # 目標 α
-            "rank_M": rank_M,             # d×d 部分の実効ランク
-            "rank_B": rank_B,             # (d+1)×(d+1) 全体の実効ランク
-            "alpha": actual_alpha         # 実測 α = rank(B) - rank(M)
-        }
+        effective_r = min(rank, len(S), d_l)
+        S_trunc = torch.abs(S[:effective_r]) * init_scale + 0.1
+        sqrt_S = torch.sqrt(S_trunc)
 
-    except Exception as e:
-        print(f"  実験失敗: {e}")
-        return None
+        W_Q_new = torch.zeros(input_dim, d_l, device=device)
+        W_K_new = torch.zeros(input_dim, d_l, device=device)
+        W_Q_new[:, :effective_r] = U[:, :effective_r] @ torch.diag(sqrt_S)
+        W_K_new[:, :effective_r] = Vh[:effective_r, :].T @ torch.diag(sqrt_S)
+
+        model = SelfLinearAttention(input_dim, d_l, init_scale).to(device)
+        model.W_Q.data = W_Q_new
+        model.W_K.data = W_K_new
+
+        # 実効ランク計測
+        B_check = model.W_Q @ model.W_K.T
+        rank_actual = torch.linalg.matrix_rank(B_check).item()
+
+    return model, rank_actual
 
 
 # ============================================================
@@ -584,214 +362,3 @@ CONFIGS = [
     ("medium", (15, 25), 100, 5e-7, 10000, 100000, 100),
     ("large",  (25, 35), 100, 5e-7, 10000, 100000, 100),
 ]
-
-
-def run_all_experiments(
-    configs=CONFIGS,
-    device='cpu',
-    dl_ratio_range=(0.5, 1.5),
-    alpha_list=[0, 1, 2],
-    use_bottleneck: bool = True
-):
-    """
-    全規模の実験を実行 (α 制御版)
-
-    Args:
-        configs: 実験設定のリスト
-        device: デバイス
-        dl_ratio_range: d_l/d の比率の範囲
-        alpha_list: 選択可能な α のリスト
-        use_bottleneck: True の場合、r_M ≤ 2d - d_l のボトルネック条件を適用
-    """
-    results = []
-
-    print(f"\n{'#'*60}")
-    print(f"# α 制御版実験")
-    print(f"# dl_ratio_range: {dl_ratio_range}")
-    print(f"# alpha_list: {alpha_list}")
-    print(f"{'#'*60}")
-
-    for name, d_range, N, lr, num_steps, num_data, num_trials in configs:
-        print(f"\n{'='*50}")
-        print(f"規模: {name} (d={d_range}, N={N}, n={num_data})")
-        print(f"{'='*50}")
-
-        for _ in tqdm(range(num_trials), desc=f"{name}"):
-            result = run_single_experiment(
-                d_range=d_range,
-                dl_ratio_range=dl_ratio_range,
-                alpha_list=alpha_list,
-                N=N,
-                lr=lr,
-                num_steps=num_steps,
-                num_data=num_data,
-                device=device,
-                use_bottleneck=use_bottleneck
-            )
-            if result is not None:
-                result["scale"] = name
-                results.append(result)
-
-        # 途中経過
-        scale_results = [r for r in results if r["scale"] == name]
-        if scale_results:
-            errors = [abs(r["est_llc"] - r["lambda_matrix"]) / r["lambda_matrix"] * 100
-                      for r in scale_results]
-            alpha_dist = {}
-            for r in scale_results:
-                a = r.get("alpha", -1)
-                alpha_dist[a] = alpha_dist.get(a, 0) + 1
-            print(f"  成功: {len(scale_results)}/{num_trials}, 平均誤差: {np.mean(errors):.1f}%, α分布: {alpha_dist}")
-
-    return results
-
-
-def plot_results(results: List[dict], save_path: str = None, dl_ratio_range: Tuple[float, float] = None, alpha_list: List[int] = None):
-    """Log-Log プロットを作成（α でグループ化、2列: λ_matrix, λ_full）"""
-    if not results:
-        print("結果がありません")
-        return
-
-    # α でグループ分け
-    alpha_values = sorted(set(r.get("alpha", 0) for r in results))
-    num_alphas = len(alpha_values)
-
-    fig, axes = plt.subplots(num_alphas, 2, figsize=(14, 4 * num_alphas + 2))
-    if num_alphas == 1:
-        axes = axes.reshape(1, -1)
-
-    # タイトル
-    title = 'LSA LLC Estimation (α Control)'
-    if dl_ratio_range:
-        title += f'\ndl_ratio_range = {dl_ratio_range}'
-    if alpha_list:
-        title += f', alpha_list = {alpha_list}'
-    fig.suptitle(title, fontsize=14, y=0.98)
-
-    # 全結果のパラメータ数の範囲（colorbar のスケール統一用）
-    all_params = np.array([r["params"] for r in results])
-    vmin, vmax = np.log10(all_params.min()), np.log10(all_params.max())
-
-    for row, alpha_val in enumerate(alpha_values):
-        alpha_results = [r for r in results if r.get("alpha", 0) == alpha_val]
-        if not alpha_results:
-            continue
-
-        lambda_matrix = np.array([r["lambda_matrix"] for r in alpha_results])
-        lambda_full = np.array([r["lambda_full"] for r in alpha_results])
-        est_llcs = np.array([r["est_llc"] for r in alpha_results])
-        params = np.array([r["params"] for r in alpha_results])
-        log_params = np.log10(params)
-
-        # === 列1: λ_matrix vs 推定値 ===
-        ax1 = axes[row, 0]
-        sc1 = ax1.scatter(lambda_matrix, est_llcs, c=log_params, cmap='magma', vmin=vmin, vmax=vmax,
-                          alpha=0.7, s=50, edgecolors='white', linewidth=0.5)
-
-        plot_min, plot_max = 1e2, 1e3
-        ax1.plot([plot_min, plot_max], [plot_min, plot_max], 'k--', alpha=0.5, label='y=x')
-
-        ax1.set_xscale('log')
-        ax1.set_yscale('log')
-        ax1.set_xlim(plot_min, plot_max)
-        ax1.set_ylim(plot_min, plot_max)
-
-        ax1.set_xlabel(r'$\lambda_{matrix}$ [d, d_l, d]', fontsize=11)
-        ax1.set_ylabel(r'Estimated LLC $\hat{\lambda}(w^*)$', fontsize=11)
-        ax1.set_title(f'α={alpha_val}: λ_matrix vs Estimated', fontsize=11)
-
-        errors1 = np.abs(est_llcs - lambda_matrix) / lambda_matrix * 100
-        textstr1 = f'N={len(alpha_results)}\nMean: {np.mean(errors1):.1f}%\nMedian: {np.median(errors1):.1f}%'
-        ax1.text(0.05, 0.95, textstr1, transform=ax1.transAxes, fontsize=9,
-                 verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
-        ax1.legend(loc='lower right')
-        ax1.grid(True, alpha=0.3)
-
-        # === 列2: λ_full vs 推定値 ===
-        ax2 = axes[row, 1]
-        sc2 = ax2.scatter(lambda_full, est_llcs, c=log_params, cmap='magma', vmin=vmin, vmax=vmax,
-                          alpha=0.7, s=50, edgecolors='white', linewidth=0.5)
-
-        ax2.plot([plot_min, plot_max], [plot_min, plot_max], 'k--', alpha=0.5, label='y=x')
-
-        ax2.set_xscale('log')
-        ax2.set_yscale('log')
-        ax2.set_xlim(plot_min, plot_max)
-        ax2.set_ylim(plot_min, plot_max)
-
-        ax2.set_xlabel(r'$\lambda_{full}$ [d+1, d_l, d+1]', fontsize=11)
-        ax2.set_ylabel(r'Estimated LLC $\hat{\lambda}(w^*)$', fontsize=11)
-        ax2.set_title(f'α={alpha_val}: λ_full vs Estimated', fontsize=11)
-
-        errors2 = np.abs(est_llcs - lambda_full) / lambda_full * 100
-        textstr2 = f'N={len(alpha_results)}\nMean: {np.mean(errors2):.1f}%\nMedian: {np.median(errors2):.1f}%'
-        ax2.text(0.05, 0.95, textstr2, transform=ax2.transAxes, fontsize=9,
-                 verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
-        ax2.legend(loc='lower right')
-        ax2.grid(True, alpha=0.3)
-
-    # 全行共通の colorbar を図の右端に配置（プロットサイズを均一に保つ）
-    fig.subplots_adjust(right=0.88)
-    cbar_ax = fig.add_axes([0.90, 0.08, 0.02, 0.84])
-    sm = plt.cm.ScalarMappable(cmap='magma', norm=plt.Normalize(vmin=vmin, vmax=vmax))
-    cbar = fig.colorbar(sm, cax=cbar_ax)
-    cbar.set_label('Log10 Params', fontsize=10)
-
-    plt.tight_layout(rect=[0, 0, 0.88, 0.96])
-
-    if save_path:
-        plt.savefig(save_path, dpi=150, bbox_inches='tight')
-        print(f"保存: {save_path}")
-
-    plt.show()
-
-
-def print_summary(results: List[dict]):
-    """結果のサマリーを表示（α でグループ化）"""
-    if not results:
-        return
-
-    print("\n" + "=" * 70)
-    print("LSA 実験結果サマリー")
-    print("=" * 70)
-
-    # α でグループ分け
-    alpha_values = sorted(set(r.get("alpha", 1) for r in results))
-
-    for alpha_val in alpha_values:
-        alpha_results = [r for r in results if r.get("alpha", 1) == alpha_val]
-        if not alpha_results:
-            continue
-
-        print(f"\n{'='*60}")
-        print(f"α = {alpha_val} のケース ({len(alpha_results)} 試行)")
-        print(f"{'='*60}")
-
-        # 2つの理論値との誤差を計算
-        errors_matrix = [abs(r["est_llc"] - r["lambda_matrix"]) / r["lambda_matrix"] * 100 for r in alpha_results]
-        errors_full = [abs(r["est_llc"] - r["lambda_full"]) / r["lambda_full"] * 100 for r in alpha_results]
-
-        print(f"\n{'理論値':<35} {'平均誤差':<12} {'中央値誤差':<12}")
-        print("-" * 60)
-        print(f"{'(1) λ_matrix [d, d_l, d]':<35} {np.mean(errors_matrix):>8.1f}%    {np.median(errors_matrix):>8.1f}%")
-        print(f"{'(2) λ_full [d+1, d_l, d+1]':<35} {np.mean(errors_full):>8.1f}%    {np.median(errors_full):>8.1f}%")
-
-        # ランクと次元の統計
-        r_list = [r.get("r_M", r["rank_M"]) for r in alpha_results]
-        d_list = [r["d"] for r in alpha_results]
-        d_l_list = [r["d_l"] for r in alpha_results]
-        rank_M_list = [r["rank_M"] for r in alpha_results]
-        rank_B_list = [r["rank_B"] for r in alpha_results]
-
-        print(f"\n--- 次元・ランク統計 ---")
-        print(f"d:                   平均 {np.mean(d_list):.1f}, 範囲 [{min(d_list)}, {max(d_list)}]")
-        print(f"d_l:                 平均 {np.mean(d_l_list):.1f}, 範囲 [{min(d_l_list)}, {max(d_l_list)}]")
-        print(f"r_M (目標):          平均 {np.mean(r_list):.1f}, 範囲 [{min(r_list)}, {max(r_list)}]")
-        print(f"rank(M) [d×d]:       平均 {np.mean(rank_M_list):.1f}, 範囲 [{min(rank_M_list)}, {max(rank_M_list)}]")
-        print(f"rank(B) [(d+1)×(d+1)]: 平均 {np.mean(rank_B_list):.1f}, 範囲 [{min(rank_B_list)}, {max(rank_B_list)}]")
-
-    # 全体のα分布
-    all_alpha = [r.get("alpha", 0) for r in results]
-    print(f"\n{'='*60}")
-    print(f"全体: α の分布 = {dict(zip(*np.unique(all_alpha, return_counts=True)))}")
-    print("=" * 70)
